@@ -1,0 +1,29 @@
+{
+  "upstream_base_url": "https://your-upstream-relay.example/v1",
+  "api_key": "sk-REPLACE_WITH_YOUR_KEY",
+  "fallback_api_keys": [
+    "sk-OPTIONAL_SECOND_KEY"
+  ],
+  "listen_host": "127.0.0.1",
+  "listen_port": 8181,
+  "model": "claude-opus-4-8",
+  "upstream_timeout_s": 300,
+  "features": {
+    "tool_injection": true,
+    "strict_tool_names": true,
+    "flatten_tool_history": true,
+    "strip_thinking": true,
+    "enforce_max_tokens": true,
+    "enforce_stop_sequences": true,
+    "usage_mode": "normalized",
+    "usage_baseline_tokens": 0,
+    "compact_tool_schemas": true,
+    "ultra_compact_tools": true,
+    "max_history_messages": 60,
+    "max_tool_result_chars": 0,
+    "max_output_tokens": 0,
+    "web_tools_enabled": true,
+    "web_tools_max_iters": 4
+  },
+  "ui_lang": "en"
+}

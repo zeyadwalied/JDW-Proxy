@@ -1,0 +1,34 @@
+# Secrets / local config (NEVER commit real API keys)
+config.json
+*.key
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Logs & runtime dumps (may contain masked keys / request traces)
+_logs_dump.json
+_logs_live.json
+_logs_*.json
+_cfg_*.json
+_tool_test.txt
+startup_out.txt
+startup_err.txt
+*.log
+
+# Local test / probe scratch
+tests/
+probe/
+0.110
+0.27
+0.29
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

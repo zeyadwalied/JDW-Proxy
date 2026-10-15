@@ -54,7 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -118,6 +118,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # This cuts repeated history cost without hurting the current step.
         # 0 = disabled (apply max_tool_result_chars uniformly to all).
         "recent_tool_results_full": 3,
+        # Absolute ceiling applied EVEN to the "recent full" protected results.
+        # recent_tool_results_full keeps the last N results un-trimmed, but if
+        # those happen to be HUGE reads (e.g. several 15-20KB source files) they
+        # pass upstream in full and can bloat one request to ~100KB -> the relay
+        # stalls ~100s and drops the TCP connection ("upstream connection: ").
+        # This cap keeps recent results fuller than old ones (which go to
+        # max_tool_result_chars) WITHOUT letting any single one blow the request
+        # up. 0 = no ceiling (old behaviour: protected results are unlimited).
+        "recent_tool_results_cap": 16000,
         # De-duplicate repeated tool-results: if the SAME file/output is read
         # more than once, older copies are collapsed to a short marker that
         # points at the newest copy. Safe for quality (the latest copy is kept
@@ -207,7 +216,7 @@ def get_upstream_client() -> httpx.AsyncClient:
         limits = httpx.Limits(max_connections=50,
                               max_keepalive_connections=20,
                               keepalive_expiry=30.0)
-        _UP_CLIENT = httpx.AsyncClient(timeout=timeout, limits=limits)
+        _UP_CLIENT = httpx.AsyncClient(timeout=timeout, limits=limits, verify=False)
     return _UP_CLIENT
 
 
@@ -1190,7 +1199,8 @@ def dedup_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def flatten_messages(messages: List[Dict[str, Any]],
                      flatten_tools: bool,
                      max_tool_result_chars: int = 0,
-                     recent_full: int = 0) -> List[Dict[str, Any]]:
+                     recent_full: int = 0,
+                     recent_cap: int = 0) -> List[Dict[str, Any]]:
     """Produce an upstream-friendly messages array.
 
     If a message contains images we KEEP the structured block list (upstream
@@ -1226,7 +1236,14 @@ def flatten_messages(messages: List[Dict[str, Any]],
         content = m.get("content")
         _log_img = (idx == _last_idx)
         # Recent tool-results keep full fidelity; older ones get trimmed.
-        eff_chars = 0 if idx in protected else max_tool_result_chars
+        # But even "full" recent results are capped at recent_cap (when > 0) so a
+        # single huge read in the protected window can't bloat the request to
+        # ~100KB and stall/drop the upstream connection. recent_cap=0 keeps the
+        # old unlimited behaviour for protected results.
+        if idx in protected:
+            eff_chars = recent_cap if recent_cap > 0 else 0
+        else:
+            eff_chars = max_tool_result_chars
 
         if not flatten_tools:
             out.append({"role": role, "content": content})
@@ -1911,6 +1928,10 @@ async def resolve_server_tools(payload: Dict[str, Any],
 def build_upstream_payload(client_req: Dict[str, Any],
                            feats: Dict[str, Any]) -> Dict[str, Any]:
     model = client_req.get("model") or CONFIG["model"]
+    # Model Aliasing: map unknown models to configured model
+    valid_upstream_models = {"claude-opus-4-8", "claude-opus5.5", "gpt-6.1-sol"}
+    if model not in valid_upstream_models:
+        model = CONFIG.get("model", "claude-opus-4-8")
 
     # system prompt (+ tool injection)
     system_text = extract_system_text(client_req.get("system"))
@@ -2032,7 +2053,8 @@ def build_upstream_payload(client_req: Dict[str, Any],
     msgs = flatten_messages(all_msgs,
                             feats.get("flatten_tool_history", True),
                             int(feats.get("max_tool_result_chars", 0) or 0),
-                            int(feats.get("recent_tool_results_full", 0) or 0))
+                            int(feats.get("recent_tool_results_full", 0) or 0),
+                            int(feats.get("recent_tool_results_cap", 0) or 0))
     # Enforce the upstream's strict contract (start-with-user + strict
     # alternation). This is the definitive fix for the recurring 400
     # 'messages must have alternating user and assistant roles' error that
@@ -2448,6 +2470,18 @@ async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
     # attempts (including sleeps), stop retrying and surface a 502 immediately
     # so the client can react fast instead of hanging.
     TOTAL_BUDGET_S = 90.0
+    # A SINGLE attempt must never be able to consume the whole retry budget.
+    # The relay sits behind Cloudflare with a ~100s hard cutoff: a dead channel
+    # holds the TCP open until that cutoff and THEN throws. If one attempt can
+    # run that long it eats the entire budget and the loop gives up at attempt 1
+    # with after_status 0 (observed: elapsed_s ~100 against a 90s budget -> zero
+    # usable retries). So we cap EACH attempt's timeout so at least TWO fit
+    # inside the budget (with room for one back-off), regardless of how high
+    # upstream_timeout_s is configured. Healthy responses return in a few
+    # seconds, so this only ever abandons a hung/dead channel early enough to
+    # actually retry on a fresh one.
+    _cfg_timeout = float(CONFIG.get("upstream_timeout_s", 75) or 75)
+    per_attempt_timeout = min(_cfg_timeout, (TOTAL_BUDGET_S - 6.0) / 2.0)
     loop_t0 = time.time()
     status = 0
     data: Dict[str, Any] = {}
@@ -2486,7 +2520,8 @@ async def _try_one_key(client: httpx.AsyncClient, url: str, api_key: str,
             await asyncio.sleep(delay)
         attempt_t0 = time.time()
         try:
-            r = await client.post(url, headers=headers, json=payload)
+            r = await client.post(url, headers=headers, json=payload,
+                                    timeout=per_attempt_timeout)
         except Exception as e:  # network error -> retry
             last_exc = e
             status = 0
@@ -2879,12 +2914,49 @@ async def count_tokens(request: Request):
     return JSONResponse(content={"input_tokens": total})
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint that proxies directly to the upstream."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON"}})
+    if body.get("model") not in {"gpt-6.1-sol", "claude-opus-4-8", "claude-opus5.5"}:
+        body["model"] = "gpt-6.1-sol"
+    url = CONFIG["upstream_base_url"].rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {CONFIG['api_key']}"}
+    client = get_upstream_client()
+    try:
+        resp = await client.post(url, json=body, headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": {"message": f"Upstream error: {e}"}})
+
+
+@app.get("/admin/upstream-balance")
+async def get_upstream_balance():
+    """Fetches real-time budget, usage, and expiration from the upstream server."""
+    base = CONFIG.get("upstream_base_url", "").rstrip("/")
+    root = base[:-3] if base.endswith("/v1") else base
+    status_url = f"{root}/account/api/status"
+    api_key = CONFIG.get("api_key", "")
+    try:
+        async with httpx.AsyncClient(timeout=10, verify=False) as client:
+            resp = await client.post(status_url, headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code == 200:
+                return JSONResponse(content={"ok": True, "data": resp.json()})
+            else:
+                return JSONResponse(content={"ok": False, "status": resp.status_code, "error": resp.text})
+    except Exception as e:
+        return JSONResponse(content={"ok": False, "error": str(e)})
+
+
 @app.get("/v1/models")
 async def models():
     url = CONFIG["upstream_base_url"].rstrip("/") + "/models"
-    headers = {"x-api-key": CONFIG["api_key"], "anthropic-version": "2023-06-01"}
+    headers = {"x-api-key": CONFIG["api_key"], "Authorization": f"Bearer {CONFIG['api_key']}", "anthropic-version": "2023-06-01"}
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, verify=False) as client:
             r = await client.get(url, headers=headers)
             return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception:

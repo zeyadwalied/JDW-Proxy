@@ -114,6 +114,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <main>
   <div>
+    <div class="card" style="border-left: 3px solid var(--accent)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <h2 style="margin:0;font-size:15px">Upstream Account Balance</h2>
+        <span id="balStatus" style="font-weight:700;font-size:11px;padding:2px 8px;border-radius:12px;background:#1f6feb33;color:var(--accent2)">CHECKING...</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+        <div style="background:var(--panel2);padding:8px 10px;border-radius:6px;border:1px solid var(--border)">
+          <div style="font-size:11px;color:var(--muted)">Used Units</div>
+          <div id="balUsed" style="font-size:15px;font-weight:700;color:var(--text);font-family:var(--mono)">—</div>
+        </div>
+        <div style="background:var(--panel2);padding:8px 10px;border-radius:6px;border:1px solid var(--border)">
+          <div style="font-size:11px;color:var(--muted)">Reserved</div>
+          <div id="balReserved" style="font-size:15px;font-weight:700;color:var(--muted);font-family:var(--mono)">—</div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:11.5px;color:var(--muted)">Expires: <strong id="balExpires" style="color:var(--text)">—</strong></span>
+        <button type="button" class="ghost" onclick="fetchBalance()" style="padding:3px 9px;font-size:11px">↻ Refresh</button>
+      </div>
+    </div>
+
     <div class="card">
       <h2 data-i="endpointTitle">Client endpoint</h2>
       <div class="endpoint" id="endpointUrl">http://localhost:8181/v1</div>
@@ -125,7 +146,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <h2 data-i="connTitle">Connection</h2>
       <div class="field">
         <span data-i="upstream">Upstream base URL</span>
-        <input type="text" id="upstream"/>
+        <input type="text" id="upstream" placeholder="https://api.justwoker.icu/v1"/>
       </div>
       <div class="field">
         <span data-i="model">Model</span>
@@ -422,7 +443,7 @@ function resetDefaults(){
 
 async function loadConfig(){
   const r=await fetch('/admin/config'); const c=await r.json();
-  document.getElementById('upstream').value=c.upstream_base_url||'';
+  document.getElementById('upstream').value = c.upstream_base_url || 'https://api.justwoker.icu/v1';
   document.getElementById('model').value=c.model||'';
   document.getElementById('apikey').value=c.api_key_masked||'';
   renderFbKeys(c.fallback_api_keys_masked||[]);
@@ -451,6 +472,15 @@ async function loadConfig(){
   if(c.ui_lang && c.ui_lang!==LANG) setLang(c.ui_lang, false);
 }
 
+function cleanInt(v,dflt){
+  // Strip anything that is not a digit (commas, spaces, letters) so a value
+  // like "20,000" or "20000 " still parses to 20000 instead of silently
+  // collapsing to the fallback via parseInt+||.
+  const s=String(v==null?'':v).replace(/[^0-9]/g,'');
+  if(s==='') return dflt;
+  const n=parseInt(s,10);
+  return isNaN(n)?dflt:n;
+}
 async function saveConfig(){
   const body={
     upstream_base_url:document.getElementById('upstream').value,
@@ -467,11 +497,11 @@ async function saveConfig(){
       enforce_stop_sequences:document.getElementById('enforce_stop_sequences').checked,
       compact_tool_schemas:document.getElementById('compact_tool_schemas').checked,
       ultra_compact_tools:document.getElementById('ultra_compact_tools').checked,
-      max_history_messages:parseInt(document.getElementById('max_history_messages').value)||0,
-      max_tool_result_chars:parseInt(document.getElementById('max_tool_result_chars').value)||0,
-      max_output_tokens:parseInt(document.getElementById('max_output_tokens').value)||0,
+      max_history_messages:cleanInt(document.getElementById('max_history_messages').value,0),
+      max_tool_result_chars:cleanInt(document.getElementById('max_tool_result_chars').value,0),
+      max_output_tokens:cleanInt(document.getElementById('max_output_tokens').value,0),
       web_tools_enabled:document.getElementById('web_tools_enabled').checked,
-      web_tools_max_iters:parseInt(document.getElementById('web_tools_max_iters').value)||4,
+      web_tools_max_iters:cleanInt(document.getElementById('web_tools_max_iters').value,4),
       usage_mode:document.getElementById('usage_mode').value,
       usage_baseline_tokens:parseInt(document.getElementById('usage_baseline_tokens').value)||0
     }
@@ -585,7 +615,36 @@ function renderLogs(logs){
 }
 function escapeHtml(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
-async function pollLogs(){
+async function fetchBalance(){
+    try{
+      const r=await fetch('/admin/upstream-balance');
+      const res=await r.json();
+      if(res.ok && res.data){
+        const d=res.data;
+        const st=document.getElementById('balStatus');
+        if(st){
+          st.textContent=(d.status||'ACTIVE').toUpperCase();
+          st.style.color=d.status==='active'?'var(--accent2)':'var(--danger)';
+          st.style.background=d.status==='active'?'#2ea04322':'#f8514922';
+        }
+        const u=document.getElementById('balUsed');
+        if(u) u.textContent=Number(d.used||0).toLocaleString();
+        const resEl=document.getElementById('balReserved');
+        if(resEl) resEl.textContent=Number(d.reserved||0).toLocaleString();
+        const exp=document.getElementById('balExpires');
+        if(exp){
+          if(d.expires_at){
+            const dt=new Date(d.expires_at*1000);
+            exp.textContent=dt.toLocaleDateString()+' '+dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+          } else {
+            exp.textContent='Never / Unlimited';
+          }
+        }
+      }
+    }catch(e){console.error('Failed to fetch balance',e);}
+  }
+
+  async function pollLogs(){
   try{ const r=await fetch('/admin/logs'); const d=await r.json(); renderLogs(d.logs);
     document.getElementById('statusDot').className='dot on';
   }catch(e){ document.getElementById('statusDot').className='dot off'; }
@@ -603,7 +662,9 @@ async function stopProxy(){
 }
 
 loadConfig();
+fetchBalance();
 pollLogs();
+setInterval(fetchBalance, 15000);
 setInterval(pollLogs,2000);
 </script>
 </body>
